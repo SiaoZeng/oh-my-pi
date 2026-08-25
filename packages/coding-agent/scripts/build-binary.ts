@@ -49,15 +49,35 @@ async function main(): Promise<void> {
 	// Generate inside the try so the finally always restores the empty checked-in
 	// placeholders (stats client archive, docs index) even on failure.
 	try {
-		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
-		await runCommand(["bun", "scripts/generate-docs-index.ts", "--generate"]);
+		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats"]);
+		await runCommand(["bun", "run", "gen:docs"]);
+		// `legacy-pi-bundled-registry.ts` static-imports
+		// `@oh-my-pi/pi-coding-agent/export/html` (one of pi-coding-agent's
+		// named subpath exports, see scripts/generate-legacy-pi-bundled-registry.ts),
+		// whose source pulls in `tool-views.generated.js`. The root
+		// `package.json` "prepare" lifecycle hook builds that file on
+		// `bun install`, but a clean binary build that skips install hooks
+		// would `bun build --compile` against the registry entry and fail
+		// resolving the missing generated bundle. Rebuilding the tool views
+		// here makes the compile self-contained and matches what `prepack`
+		// does for the npm bundle.
+		await runCommand(["bun", "--cwd=../collab-web", "run", "gen:tool-views"]);
 		await runCommand(
-			["bun", "--cwd=../natives", "run", "embed:native"],
+			["bun", "--cwd=../natives", "run", "gen:native"],
 			crossTarget
 				? { ...Bun.env, TARGET_PLATFORM: crossPlatform as string, TARGET_ARCH: crossArch as string }
 				: Bun.env,
 		);
-		await runCommand(["bun", "scripts/embed-mupdf-wasm.ts", "--generate"]);
+		await runCommand(["bun", "run", "gen:mupdf"]);
+		// Regenerate the bundled-pi registry + key set before the compile so any
+		// new pi-* subpath export added under `packages/*/package.json` is served
+		// from the host's in-process copy. Without this, `bun build --compile`
+		// would freeze whatever the committed registry happened to enumerate at
+		// the time of the last manual `--generate`, and a new subpath added
+		// since then would crash extension validation with `Cannot find module`
+		// (issue #3442). The generator also normalizes formatting, so the diff
+		// against the committed copy stays clean.
+		await runCommand(["bun", "scripts/generate-legacy-pi-bundled-registry.ts", "--generate"]);
 		try {
 			const buildEnv = shouldAdhocSignDarwinBinary() ? { ...Bun.env, BUN_NO_CODESIGN_MACHO_BINARY: "1" } : Bun.env;
 			await runCommand(
@@ -103,12 +123,12 @@ async function main(): Promise<void> {
 				await runCommand(["codesign", "--force", "--sign", "-", outputPath]);
 			}
 		} finally {
-			await runCommand(["bun", "scripts/embed-mupdf-wasm.ts", "--reset"]);
-			await runCommand(["bun", "--cwd=../natives", "run", "embed:native", "--reset"]);
+			await runCommand(["bun", "run", "gen:mupdf:reset"]);
+			await runCommand(["bun", "--cwd=../natives", "run", "gen:native:reset"]);
 		}
 	} finally {
-		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--reset"]);
-		await runCommand(["bun", "scripts/generate-docs-index.ts", "--reset"]);
+		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
+		await runCommand(["bun", "run", "gen:docs:reset"]);
 	}
 }
 

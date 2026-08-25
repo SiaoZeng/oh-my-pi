@@ -1,18 +1,17 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type Skill as CapabilitySkill, skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { getCapability } from "@oh-my-pi/pi-coding-agent/discovery";
+import { getWslWindowsHomeCandidate, runHostProbe } from "@oh-my-pi/pi-coding-agent/discovery/agents";
 import {
-	loadPortableSharedSkill,
+	type LoadSkillsResult,
 	loadSkills,
 	loadSkillsFromDir,
-	registerPortableSharedSkill,
+	parseSkillInvocation,
 	type Skill,
 } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
-import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
-import { SkillProtocolHandler, validateSkillReferences } from "@oh-my-pi/pi-coding-agent/internal-urls/skill-protocol";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
@@ -48,8 +47,13 @@ const DISABLE_ALL_BUILTIN_SKILLS = {
 
 describe("skills", () => {
 	describe("loadSkillsFromDir", () => {
-		const loadFixtureRoot = () => loadSkillsFromDir({ dir: fixturesDir, source: "test" });
+		let fixtureRoot: LoadSkillsResult;
 
+		beforeAll(async () => {
+			fixtureRoot = await loadSkillsFromDir({ dir: fixturesDir, source: "test" });
+		});
+
+		const loadFixtureRoot = async () => fixtureRoot;
 		it("should load a valid skill from a skills root", async () => {
 			const { skills, warnings } = await loadFixtureRoot();
 			const validSkill = skills.find(skill => skill.name === "valid-skill");
@@ -159,15 +163,23 @@ describe("skills", () => {
 	});
 
 	describe("loadSkills with options", () => {
+		let customDirectorySkills: LoadSkillsResult;
+
+		beforeAll(async () => {
+			customDirectorySkills = await loadSkills({
+				...DISABLE_ALL_BUILTIN_SKILLS,
+				customDirectories: [fixturesDir],
+			});
+		});
 		it("should load from customDirectories only when built-ins disabled", async () => {
-			const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [fixturesDir] });
+			const { skills } = customDirectorySkills;
 			expect(skills.length).toBeGreaterThan(0);
 			// Custom directory skills have source "custom:user"
 			expect(skills.every(s => s.source.startsWith("custom"))).toBe(true);
 		});
 
 		it("should return customDirectory skills sorted by name (case-insensitive)", async () => {
-			const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [fixturesDir] });
+			const { skills } = customDirectorySkills;
 
 			expect(skills.map(s => s.name)).toEqual(expectedFixtureSkillOrder);
 		});
@@ -235,6 +247,87 @@ describe("skills", () => {
 				await removeWithRetries(tempHome);
 				await removeWithRetries(tempCwd);
 			}
+		});
+
+		it("should load Windows host ~/.agents/skills when running under WSL (#3779)", async () => {
+			const tempHostHome = await fs.mkdtemp(path.join(os.tmpdir(), "pi-agents-wsl-host-"));
+			const tempCwd = await fs.mkdtemp(path.join(os.tmpdir(), "pi-agents-wsl-cwd-"));
+			const skillDir = path.join(tempHostHome, ".agents", "skills", "wsl-host-skill");
+			await fs.mkdir(skillDir, { recursive: true });
+			await fs.writeFile(
+				path.join(skillDir, "SKILL.md"),
+				["---", "description: Loaded from WSL host USERPROFILE", "---", "", "# wsl-host-skill"].join("\n"),
+			);
+			const previousWslDistroName = process.env.WSL_DISTRO_NAME;
+			const previousWslInterop = process.env.WSL_INTEROP;
+			const previousUserProfile = process.env.USERPROFILE;
+			const previousPlatform = process.platform;
+			Object.defineProperty(process, "platform", { value: "linux" });
+			process.env.WSL_DISTRO_NAME = "Ubuntu";
+			delete process.env.WSL_INTEROP;
+			process.env.USERPROFILE = tempHostHome;
+			try {
+				const { skills } = await loadSkills({
+					enableCodexUser: false,
+					enableClaudeUser: false,
+					enableClaudeProject: false,
+					enablePiUser: false,
+					enablePiProject: false,
+					cwd: tempCwd,
+				});
+				const skill = skills.find(s => s.name === "wsl-host-skill");
+				expect(skill?.source).toBe("agents:user");
+				expect(skill?.filePath).toBe(path.join(skillDir, "SKILL.md"));
+			} finally {
+				if (previousWslDistroName === undefined) delete process.env.WSL_DISTRO_NAME;
+				else process.env.WSL_DISTRO_NAME = previousWslDistroName;
+				if (previousWslInterop === undefined) delete process.env.WSL_INTEROP;
+				else process.env.WSL_INTEROP = previousWslInterop;
+				if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+				else process.env.USERPROFILE = previousUserProfile;
+				Object.defineProperty(process, "platform", { value: previousPlatform });
+				await removeWithRetries(tempHostHome);
+				await removeWithRetries(tempCwd);
+			}
+		});
+
+		it("converts Windows USERPROFILE paths to the default WSL mount (#3779)", () => {
+			const resolved = getWslWindowsHomeCandidate({
+				platform: "linux",
+				env: { WSL_DISTRO_NAME: "Ubuntu", USERPROFILE: "C:\\Users\\alice" },
+				wslPath: () => undefined,
+			});
+
+			expect(resolved).toBe("/mnt/c/Users/alice");
+		});
+
+		it("resolves the Windows profile through interop when USERPROFILE is not exported (#3779)", () => {
+			const resolved = getWslWindowsHomeCandidate({
+				platform: "linux",
+				env: { WSL_DISTRO_NAME: "Ubuntu" },
+				windowsUserProfile: () => "C:\\Users\\alice",
+				wslPath: () => "/mnt/c/Users/alice",
+			});
+
+			expect(resolved).toBe("/mnt/c/Users/alice");
+		});
+
+		it("kills a host probe that never exits instead of blocking startup (#8402)", () => {
+			// Integration test against real OS timer behavior: the contract is that
+			// runHostProbe's spawnSync `timeout` actually kills a genuinely blocked
+			// child. Injecting a short deadline preserves that native lifecycle
+			// coverage without paying the production discovery budget.
+			const start = performance.now();
+			const result = runHostProbe([process.execPath, "-e", "await Bun.sleep(60_000)"], 25);
+			const elapsed = performance.now() - start;
+			expect(result).toBeUndefined();
+			// Loose bound proves the probe returned via its timeout, not the child.
+			expect(elapsed).toBeLessThan(1_000);
+		});
+
+		it("returns trimmed stdout for a host probe that succeeds (#8402)", () => {
+			const result = runHostProbe([process.execPath, "-e", "process.stdout.write('  host-home  ')"]);
+			expect(result).toBe("host-home");
 		});
 
 		it("respects an explicit enableAgentsUser: false (#2401)", async () => {
@@ -499,199 +592,97 @@ describe("collision handling", () => {
 	});
 });
 
-describe("portable shared skill references", () => {
-	it("resolves portable-shared references from the active agent skill root", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-portable-shared-"));
-		try {
-			const references = path.join(root, "skills", "references");
-			await fs.mkdir(references, { recursive: true });
-			await fs.writeFile(path.join(references, "w-question.md"), "shared evidence", "utf8");
-			const shared = await loadPortableSharedSkill(root);
-			expect(shared).not.toBeNull();
+describe("parseSkillInvocation", () => {
+	describe("leading `/skill:<name>` form", () => {
+		it("parses a bare leading command", () => {
+			expect(parseSkillInvocation("/skill:foo")).toEqual({ name: "foo", args: "" });
+		});
 
-			const resource = await new SkillProtocolHandler().resolve(
-				parseInternalUrl("skill://portable-shared/references/w-question.md"),
-				{ skills: [shared!] },
-			);
-			expect(resource.content).toBe("shared evidence");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		it("captures everything after the first space as args", () => {
+			expect(parseSkillInvocation("/skill:foo focus on auth")).toEqual({
+				name: "foo",
+				args: "focus on auth",
+			});
+		});
+
+		it("allows leading whitespace before the `/skill:<name>` command", () => {
+			expect(parseSkillInvocation("  /skill:foo focus on auth")).toEqual({
+				name: "foo",
+				args: "focus on auth",
+			});
+		});
+
+		it("returns undefined for the bare `/skill:` prefix", () => {
+			expect(parseSkillInvocation("/skill:")).toBeUndefined();
+		});
 	});
 
-	it("rejects portable-shared symlinks that escape the active skill root", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-portable-shared-escape-"));
-		try {
-			const references = path.join(root, "skills", "references");
-			const outside = path.join(root, "outside.md");
-			await fs.mkdir(references, { recursive: true });
-			await fs.writeFile(outside, "outside", "utf8");
-			await fs.symlink(outside, path.join(references, "escape.md"));
-			const shared = await loadPortableSharedSkill(root);
+	describe("mid-prompt `/skill:<name>` form (issue #3913)", () => {
+		it("threads surrounding prose through as args when the skill token appears after typed text", () => {
+			expect(parseSkillInvocation("fix the auth bug /skill:security-scan ")).toEqual({
+				name: "security-scan",
+				args: "fix the auth bug",
+			});
+		});
 
-			await expect(
-				new SkillProtocolHandler().resolve(parseInternalUrl("skill://portable-shared/references/escape.md"), {
-					skills: [shared!],
-				}),
-			).rejects.toThrow("Path traversal is not allowed");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		it("collapses prose on both sides of the skill token into a single args string", () => {
+			expect(parseSkillInvocation("leading /skill:foo trailing")).toEqual({
+				name: "foo",
+				args: "leading trailing",
+			});
+		});
 
-	it("replaces managed collisions but preserves authored portable-shared skills", () => {
-		const shared: Skill = {
-			name: "portable-shared",
-			description: "shared",
-			filePath: "/agent/skills",
-			baseDir: "/agent/skills",
-			source: "native:user",
-			hide: true,
-		};
-		const managed: Skill = {
-			...shared,
-			filePath: "/agent/managed-skills/portable-shared/SKILL.md",
-			baseDir: "/agent/managed-skills/portable-shared",
-			source: "omp-managed:user",
-			_source: {
-				provider: "omp-managed",
-				providerName: "Managed",
-				level: "user",
-				path: "/agent/managed-skills",
-			},
-		};
-		const authored: Skill = {
-			...shared,
-			filePath: "/project/skills/portable-shared/SKILL.md",
-			baseDir: "/project/skills/portable-shared",
-			source: "custom:project",
-			_source: {
-				provider: "custom",
-				providerName: "Custom",
-				level: "project",
-				path: "/project/skills",
-			},
-		};
+		it("preserves embedded newlines in args when the skill token spans a line break", () => {
+			expect(parseSkillInvocation("explain this\nthen use /skill:security-scan ")).toEqual({
+				name: "security-scan",
+				args: "explain this\nthen use",
+			});
+		});
 
-		const managedMap = new Map([[managed.name, managed]]);
-		registerPortableSharedSkill(managedMap, shared);
-		expect(managedMap.get("portable-shared")?.filePath).toBe(shared.filePath);
+		it("does not hijack another slash command whose args mention a skill", () => {
+			expect(parseSkillInvocation("/compact /skill:security-scan")).toBeUndefined();
+			expect(parseSkillInvocation("/goal set /skill:foo focus on auth")).toBeUndefined();
+		});
 
-		const authoredMap = new Map([[authored.name, authored]]);
-		registerPortableSharedSkill(authoredMap, shared);
-		expect(authoredMap.get("portable-shared")?.filePath).toBe(authored.filePath);
-	});
+		it("does not hijack the bash tool (`!cmd`) when the body mentions a skill", () => {
+			expect(parseSkillInvocation("!echo /skill:reviewer")).toBeUndefined();
+			expect(parseSkillInvocation("!!echo /skill:reviewer")).toBeUndefined();
+			expect(parseSkillInvocation("   !echo /skill:reviewer")).toBeUndefined();
+		});
 
-	it("rejects unresolved mandatory skill references with source evidence", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mandatory-skill-ref-"));
-		try {
-			const filePath = path.join(root, "SKILL.md");
-			await fs.writeFile(filePath, "Required: skill://missing/reference.md\n", "utf8");
-			const skill: Skill = {
-				name: "source-skill",
-				description: "source",
-				filePath,
-				baseDir: root,
-				source: "test:user",
-			};
-			await expect(validateSkillReferences([skill])).rejects.toThrow(
-				`${filePath}: skill://missing/reference.md: Unknown skill: missing`,
-			);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		it("does not hijack the python tool (`$ code`) when the body mentions a skill", () => {
+			expect(parseSkillInvocation("$ run.py /skill:foo")).toBeUndefined();
+			expect(parseSkillInvocation("$$ run.py /skill:foo")).toBeUndefined();
+			expect(parseSkillInvocation("$\trun /skill:foo")).toBeUndefined();
+		});
 
-	it("warns for OPTIONAL unresolved references and ignores fenced examples", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-optional-skill-ref-"));
-		try {
-			const filePath = path.join(root, "SKILL.md");
-			await fs.writeFile(
-				filePath,
-				"OPTIONAL: skill://missing/optional.md\n````text\nskill://missing/four-backtick-example.md\n````not-a-close\nskill://missing/still-fenced.md\n````\n~~~text\nskill://missing/unclosed-example.md\n",
-				"utf8",
-			);
-			const skill: Skill = {
-				name: "source-skill",
-				description: "source",
-				filePath,
-				baseDir: root,
-				source: "test:user",
-			};
-			const warnings = await validateSkillReferences([skill]);
-			expect(warnings).toHaveLength(1);
-			expect(warnings[0].skillPath).toBe(filePath);
-			expect(warnings[0].message).toContain("skill://missing/optional.md");
-			expect(warnings[0].message).not.toContain("example.md");
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		it("still matches when `$` is followed by prose, not a python whitespace sigil", () => {
+			// `$echo`, `${HOME}`, and `$200` are not python commands — `pythonCommandPrefixLength`
+			// returns 0 for them — so the mid-prompt parser must still see the embedded skill.
+			expect(parseSkillInvocation("$echo /skill:reviewer")).toEqual({
+				name: "reviewer",
+				args: "$echo",
+			});
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: testing literal string containing shell variable
+			expect(parseSkillInvocation("${HOME}/bin /skill:foo")).toEqual({
+				name: "foo",
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: testing literal string containing shell variable
+				args: "${HOME}/bin",
+			});
+		});
 
-	it("does not treat four-space-indented pseudo-fences as Markdown fences", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-indented-skill-ref-"));
-		try {
-			const filePath = path.join(root, "SKILL.md");
-			await fs.writeFile(filePath, "    ```text\nskill://missing/not-fenced.md\n    ```\n", "utf8");
-			const skill: Skill = {
-				name: "source-skill",
-				description: "source",
-				filePath,
-				baseDir: root,
-				source: "test:user",
-			};
-			await expect(validateSkillReferences([skill])).rejects.toThrow(
-				`${filePath}: skill://missing/not-fenced.md: Unknown skill: missing`,
-			);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		it("returns undefined when no `/skill:<name>` token is present", () => {
+			expect(parseSkillInvocation("no skill token here")).toBeUndefined();
+		});
 
-	it("closes valid CRLF Markdown fences before validating following references", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-crlf-skill-ref-"));
-		try {
-			const filePath = path.join(root, "SKILL.md");
-			await fs.writeFile(
-				filePath,
-				"```text\r\nskill://missing/fenced.md\r\n```\r\nskill://missing/after-fence.md\r\n",
-				"utf8",
-			);
-			const skill: Skill = {
-				name: "source-skill",
-				description: "source",
-				filePath,
-				baseDir: root,
-				source: "test:user",
-			};
-			await expect(validateSkillReferences([skill])).rejects.toThrow(
-				`${filePath}: skill://missing/after-fence.md: Unknown skill: missing`,
-			);
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		it("does not match when the slash is glued to a preceding non-whitespace character", () => {
+			expect(parseSkillInvocation("https://example.com/skill:foo")).toBeUndefined();
+		});
 
-	it("does not hide references behind malformed backtick fence candidates", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-malformed-fence-ref-"));
-		try {
-			const filePath = path.join(root, "SKILL.md");
-			const skill: Skill = {
-				name: "source-skill",
-				description: "source",
-				filePath,
-				baseDir: root,
-				source: "test:user",
-			};
-			for (const content of [
-				"```lang`invalid\nskill://missing/unclosed-malformed.md\n",
-				"```lang`invalid\nskill://missing/closed-malformed.md\n```\n",
-			]) {
-				await fs.writeFile(filePath, content, "utf8");
-				await expect(validateSkillReferences([skill])).rejects.toThrow("Unknown skill: missing");
-			}
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
+		it("excludes embedded slashes from the mid-prompt skill name", () => {
+			// `/skill:foo/bar` mid-prompt is ambiguous with a path — the mid-prompt
+			// regex requires `[^\s/]+`, so this falls through with no match.
+			expect(parseSkillInvocation("see /skill:foo/bar")).toBeUndefined();
+		});
 	});
 });

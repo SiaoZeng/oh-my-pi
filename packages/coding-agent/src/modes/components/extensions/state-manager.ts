@@ -4,7 +4,7 @@
  */
 import * as path from "node:path";
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
-import { logger } from "@oh-my-pi/pi-utils";
+import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import type { ContextFile } from "../../../capability/context-file";
 import type { ExtensionModule } from "../../../capability/extension-module";
 import type { Hook } from "../../../capability/hook";
@@ -22,16 +22,21 @@ import {
 	isProviderEnabled,
 	loadCapability,
 } from "../../../discovery";
-import type {
-	DashboardState,
-	Extension,
-	ExtensionKind,
-	ExtensionState,
-	FlatTreeItem,
-	ProviderTab,
-	TreeNode,
+import { readDisabledServers, readEnabledServers } from "../../../mcp/config-writer";
+import { commandPreview } from "./inspector-model";
+import { inferMcpTransport } from "./mcp-runtime";
+import {
+	type DashboardState,
+	type Extension,
+	type ExtensionKind,
+	type ExtensionState,
+	type FlatTreeItem,
+	isShadowedExtension,
+	makeExtensionId,
+	type ProviderTab,
+	sourceFromMeta,
+	type TreeNode,
 } from "./types";
-import { makeExtensionId, sourceFromMeta } from "./types";
 
 /**
  * Settings manager interface for granular toggle persistence.
@@ -141,12 +146,32 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 		logger.warn("Failed to load extension-modules capability", { error: String(error) });
 	}
 
-	// Load MCP servers
+	// Load MCP servers. The dashboard mirrors `/mcp list` (issue #3827) by
+	// honoring the same disable signals: the dashboard-private settings list,
+	// the per-server `enabled: false` flag, and the user-level `disabledServers`
+	// denylist that `/mcp disable` writes through `setServerDisabled`. The
+	// user-level `enabledServers` allowlist overrides a non-writable source's
+	// `enabled: false` (e.g. opencode.json) but never the denylist.
 	try {
+		const userMcpPath = cwd ? getMCPConfigPath("user", cwd) : undefined;
+		const [mcpDisabledNames, mcpForcedEnabled] = await Promise.all([
+			userMcpPath
+				? readDisabledServers(userMcpPath)
+						.then(list => new Set(list))
+						.catch(() => new Set<string>())
+				: Promise.resolve(new Set<string>()),
+			userMcpPath
+				? readEnabledServers(userMcpPath)
+						.then(list => new Set(list))
+						.catch(() => new Set<string>())
+				: Promise.resolve(new Set<string>()),
+		]);
 		const mcps = await loadCapability<MCPServer>("mcps", loadOpts);
 		for (const server of mcps.all) {
 			const id = makeExtensionId("mcp", server.name);
-			const isDisabled = disabledExtensions.has(id);
+			const forced = mcpForcedEnabled.has(server.name);
+			const sourceSaysDisabled = server.enabled === false && !forced;
+			const isDisabled = mcpDisabledNames.has(server.name) || disabledExtensions.has(id) || sourceSaysDisabled;
 			const isShadowed = (server as { _shadowed?: boolean })._shadowed;
 			const providerEnabled = isProviderEnabled(server._source.provider);
 
@@ -171,8 +196,10 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 				kind: "mcp",
 				name: server.name,
 				displayName: server.name,
-				description: server.command || server.url,
-				trigger: server.transport || "stdio",
+				// Config command/url is plumbing, not a description. Live
+				// identity comes from serverInfo at inspector render time.
+				description: undefined,
+				trigger: inferMcpTransport(server),
 				path: server._source.path,
 				source: sourceFromMeta(server._source),
 				state,
@@ -199,7 +226,10 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 	try {
 		const commands = await loadCapability<SlashCommand>("slash-commands", loadOpts);
 		addItems(commands.all, "slash-command", {
-			getDescription: () => undefined,
+			getDescription: c => {
+				const preserved = typeof c.description === "string" ? c.description.trim() : "";
+				return preserved.length > 0 ? preserved : commandPreview(c.content).description;
+			},
 			getTrigger: c => `/${c.name}`,
 		});
 	} catch (error) {
@@ -282,7 +312,6 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 				name,
 				displayName: name,
 				description: file.level === "user" ? "User-level context" : "Project-level context",
-				trigger: file.level,
 				path: file.path,
 				source: sourceFromMeta(file._source),
 				state,
@@ -508,10 +537,7 @@ export function filterByProvider(extensions: Extension[], providerId: string): E
 	return extensions.filter(ext => ext.source.provider === providerId);
 }
 
-function isShadowedExtension(ext: Extension): boolean {
-	if (ext.shadowedBy) return true;
-	return Boolean((ext.raw as { _shadowed?: boolean } | null | undefined)?._shadowed);
-}
+export { isShadowedExtension } from "./types";
 
 /**
  * Apply setting-backed item disable overrides to an existing dashboard state.

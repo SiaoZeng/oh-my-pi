@@ -12,6 +12,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/memories";
 import * as memoryStorage from "@oh-my-pi/pi-coding-agent/memories/storage";
 import { getAgentDbPath, Snowflake, TempDir } from "@oh-my-pi/pi-utils";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 interface SessionFixture {
 	agentDir: string;
@@ -114,7 +115,7 @@ async function settle(promise: Promise<void>, label: string, timeoutMs = 3000): 
 }
 
 beforeAll(async () => {
-	sharedRoot = await TempDir.create(`memories-runtime-${Snowflake.next()}`);
+	sharedRoot = await TempDir.create(`@memories-runtime-${Snowflake.next()}`);
 });
 
 afterAll(async () => {
@@ -141,11 +142,11 @@ describe("memories runtime", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		process.env.XDG_DATA_HOME = savedXdgData;
-		process.env.XDG_STATE_HOME = savedXdgState;
+		restoreEnvValue("XDG_DATA_HOME", savedXdgData);
+		restoreEnvValue("XDG_STATE_HOME", savedXdgState);
 	});
 
-	test("startup gating skips when disabled or subagent depth", async () => {
+	test("startup gating follows memory.backend and skips subagents", async () => {
 		const disabled = await createFixture({ "memories.enabled": false });
 		const openSpy = vi.spyOn(memoryStorage, "openMemoryDb");
 		startMemoryStartupTask({
@@ -153,6 +154,15 @@ describe("memories runtime", () => {
 			settings: disabled.settings,
 			modelRegistry: disabled.modelRegistry,
 			agentDir: disabled.agentDir,
+			taskDepth: 0,
+		});
+		expect(openSpy).not.toHaveBeenCalled();
+		const explicitlyOff = await createFixture({ "memory.backend": "off", "memories.enabled": true });
+		startMemoryStartupTask({
+			session: explicitlyOff.session,
+			settings: explicitlyOff.settings,
+			modelRegistry: explicitlyOff.modelRegistry,
+			agentDir: explicitlyOff.agentDir,
 			taskDepth: 0,
 		});
 		expect(openSpy).not.toHaveBeenCalled();
@@ -433,8 +443,8 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		process.env.XDG_DATA_HOME = savedXdgData;
-		process.env.XDG_STATE_HOME = savedXdgState;
+		restoreEnvValue("XDG_DATA_HOME", savedXdgData);
+		restoreEnvValue("XDG_STATE_HOME", savedXdgState);
 	});
 
 	test("returns undefined for missing or empty summaries", async () => {

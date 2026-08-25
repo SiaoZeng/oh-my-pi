@@ -1,4 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
+import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { encodeStream, formatError, parseRequest } from "@oh-my-pi/pi-ai/providers/pi-native-server";
 import type {
 	AssistantMessage,
@@ -107,6 +114,7 @@ describe("pi-native parseRequest", () => {
 			context: baseContext,
 			options: {
 				temperature: 0.2,
+				cachedContent: "cachedContents/caller-owned-corpus",
 				apiKey: "should-be-stripped",
 				signal: {},
 				fetch: () => {},
@@ -118,11 +126,13 @@ describe("pi-native parseRequest", () => {
 				notARealField: "ignored",
 			},
 		});
-		expect(parsed.options).toEqual({ temperature: 0.2 });
+		expect(parsed.options).toEqual({ temperature: 0.2, cachedContent: "cachedContents/caller-owned-corpus" });
 		expect("apiKey" in parsed.options).toBe(false);
 		expect("signal" in parsed.options).toBe(false);
 		expect("fetch" in parsed.options).toBe(false);
 		expect("onPayload" in parsed.options).toBe(false);
+		expect("onResponse" in parsed.options).toBe(false);
+		expect("onSseEvent" in parsed.options).toBe(false);
 		expect("notARealField" in parsed.options).toBe(false);
 	});
 
@@ -135,7 +145,26 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.loopGuard).toEqual({ enabled: false });
 	});
 
-	it("preserves headers, metadata, sessionId, thinkingBudgets", () => {
+	it("forwards acceptEmptyResponse so a passive Google advisor can accept silence server-side", () => {
+		const parsed = parseRequest({
+			modelId: "google/gemini-3.6-flash",
+			context: baseContext,
+			options: { acceptEmptyResponse: true },
+		});
+		expect(parsed.options.acceptEmptyResponse).toBe(true);
+	});
+
+	it("forwards an explicit statefulResponses disablement to the native stream", () => {
+		const parsed = parseRequest({
+			modelId: "openai/gpt-5",
+			context: baseContext,
+			options: { promptCacheKey: "bench-cache-pair", statefulResponses: false },
+		});
+		expect(parsed.options.promptCacheKey).toBe("bench-cache-pair");
+		expect(parsed.options.statefulResponses).toBe(false);
+	});
+
+	it("preserves headers, metadata, sessionId, thinkingBudgets, and hidden thinking summaries", () => {
 		const parsed = parseRequest({
 			modelId: "x",
 			context: baseContext,
@@ -144,6 +173,7 @@ describe("pi-native parseRequest", () => {
 				metadata: { user_id: "u" },
 				sessionId: "explicit-session",
 				thinkingBudgets: { high: 8192 },
+				hideThinkingSummary: true,
 				stopSequences: ["\n\n"],
 				toolChoice: "required",
 				serviceTier: "priority",
@@ -154,10 +184,38 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.metadata).toEqual({ user_id: "u" });
 		expect(parsed.options.sessionId).toBe("explicit-session");
 		expect(parsed.options.thinkingBudgets).toEqual({ high: 8192 });
+		expect(parsed.options.hideThinkingSummary).toBe(true);
 		expect(parsed.options.stopSequences).toEqual(["\n\n"]);
 		expect(parsed.options.toolChoice).toBe("required");
 		expect(parsed.options.serviceTier).toBe("priority");
 		expect(parsed.options.cacheRetention).toBe("long");
+	});
+	it("preserves Bedrock guardrails in the canonical options bag", () => {
+		const parsed = parseRequest({
+			modelId: "amazon-bedrock/amazon.nova-lite-v1:0",
+			context: baseContext,
+			options: {
+				guardrailIdentifier: "arn:aws:bedrock:eu-west-1:123456789012:guardrail/example",
+				guardrailVersion: "7",
+				guardrailTrace: "enabled_full",
+			},
+		});
+
+		expect(parsed.options).toMatchObject({
+			guardrailIdentifier: "arn:aws:bedrock:eu-west-1:123456789012:guardrail/example",
+			guardrailVersion: "7",
+			guardrailTrace: "enabled_full",
+		});
+	});
+
+	it("forwards the explicit prompt-cache policy through the canonical options bag", () => {
+		const parsed = parseRequest({
+			modelId: "gpt-5.6",
+			context: baseContext,
+			options: { promptCache: { mode: "explicit", ttl: "30m", breakpoint: "none" } },
+		});
+
+		expect(parsed.options.promptCache).toEqual({ mode: "explicit", ttl: "30m", breakpoint: "none" });
 	});
 
 	it("rejects missing required fields", () => {
@@ -188,6 +246,50 @@ describe("pi-native parseRequest", () => {
 		expect("temperature" in parsed.options).toBe(false);
 		expect("topP" in parsed.options).toBe(false);
 		expect(parsed.options.maxTokens).toBe(100);
+	});
+});
+
+describe("pi-native gateway cache controls", () => {
+	it("delivers statefulResponses false to the provider stream", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-cache-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.setRuntimeApiKey("openrouter", "test-key");
+		const mock = createMockModel({ provider: "openrouter", id: "pi-native-cache" });
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["test-token"],
+			storage,
+			resolveModel: () => mock,
+			version: "test",
+		});
+
+		try {
+			mock.push({ content: ["ok"] });
+			const response = await fetch(`${handle.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({
+					modelId: "pi-native-cache",
+					context: baseContext,
+					options: { promptCacheKey: "bench-cache-pair", statefulResponses: false },
+					stream: false,
+				}),
+			});
+
+			expect(response.status).toBe(200);
+			await response.json();
+			expect(mock.calls).toHaveLength(1);
+			expect(mock.calls[0]?.options).toMatchObject({
+				promptCacheKey: "bench-cache-pair",
+				statefulResponses: false,
+			});
+		} finally {
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+			clearCustomApis();
+		}
 	});
 });
 describe("pi-native encodeStream", () => {

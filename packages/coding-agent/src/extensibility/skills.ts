@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import { getProjectDir } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
+import { getAgentDir, getProjectDir } from "@oh-my-pi/pi-utils";
 import {
 	isValidManagedSkillName,
 	MANAGED_SKILLS_PROVIDER_ID,
@@ -11,6 +12,7 @@ import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
+import { validateSkillReferences } from "../internal-urls/skill-reference-validation";
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
 export interface Skill {
@@ -57,6 +59,34 @@ export function setActiveSkills(value: readonly Skill[]): void {
 /** Reset the active skill snapshot. Test-only. */
 export function resetActiveSkillsForTests(): void {
 	activeSkills = [];
+}
+
+/** Build the hidden virtual skill used by `skill://portable-shared/references/*`. */
+export async function loadPortableSharedSkill(agentDir: string = getAgentDir()): Promise<Skill | null> {
+	const skillsRoot = path.join(agentDir, "skills");
+	const referencesDir = path.join(skillsRoot, "references");
+	try {
+		const stats = await fs.stat(referencesDir);
+		if (!stats.isDirectory()) return null;
+	} catch {
+		return null;
+	}
+	return {
+		name: "portable-shared",
+		description: "Shared stable references for installed skills.",
+		filePath: skillsRoot,
+		baseDir: skillsRoot,
+		source: "native:user",
+		hide: true,
+	};
+}
+
+/** Reserve `portable-shared` against managed-skill shadowing while preserving authored overrides. */
+export function registerPortableSharedSkill(skillMap: Map<string, Skill>, sharedSkill: Skill): void {
+	const existing = skillMap.get(sharedSkill.name);
+	if (!existing || existing._source?.provider === MANAGED_SKILLS_PROVIDER_ID) {
+		skillMap.set(sharedSkill.name, sharedSkill);
+	}
 }
 
 /**
@@ -366,12 +396,22 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		realPathSet.add(resolvedPath);
 	}
 
+	const portableSharedSkill = enablePiUser ? await loadPortableSharedSkill() : null;
+	if (portableSharedSkill) {
+		registerPortableSharedSkill(skillMap, portableSharedSkill);
+	}
+
 	const skills = Array.from(skillMap.values());
 	// Deterministic ordering for prompt stability (case-insensitive, then exact name, then path).
 	skills.sort((a, b) => compareSkillOrder(a.name, a.filePath, b.name, b.filePath));
+	const referenceWarnings = await validateSkillReferences(skills);
 	return {
 		skills,
-		warnings: [...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })), ...collisionWarnings],
+		warnings: [
+			...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })),
+			...collisionWarnings,
+			...referenceWarnings,
+		],
 	};
 }
 

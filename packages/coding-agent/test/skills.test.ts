@@ -4,7 +4,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type Skill as CapabilitySkill, skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { getCapability } from "@oh-my-pi/pi-coding-agent/discovery";
-import { loadSkills, loadSkillsFromDir, type Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import {
+	loadPortableSharedSkill,
+	loadSkills,
+	loadSkillsFromDir,
+	registerPortableSharedSkill,
+	type Skill,
+} from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
+import { SkillProtocolHandler, validateSkillReferences } from "@oh-my-pi/pi-coding-agent/internal-urls/skill-protocol";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
 const collisionFixturesDir = path.resolve(import.meta.dirname, "fixtures/skills-collision");
@@ -484,5 +492,202 @@ describe("collision handling", () => {
 		expect(skillMap.get("calendar")?.source).toBe("first");
 		expect(collisionWarnings).toHaveLength(1);
 		expect(collisionWarnings[0].message).toContain("name collision");
+	});
+});
+
+describe("portable shared skill references", () => {
+	it("resolves portable-shared references from the active agent skill root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-portable-shared-"));
+		try {
+			const references = path.join(root, "skills", "references");
+			await fs.mkdir(references, { recursive: true });
+			await fs.writeFile(path.join(references, "w-question.md"), "shared evidence", "utf8");
+			const shared = await loadPortableSharedSkill(root);
+			expect(shared).not.toBeNull();
+
+			const resource = await new SkillProtocolHandler().resolve(
+				parseInternalUrl("skill://portable-shared/references/w-question.md"),
+				{ skills: [shared!] },
+			);
+			expect(resource.content).toBe("shared evidence");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects portable-shared symlinks that escape the active skill root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-portable-shared-escape-"));
+		try {
+			const references = path.join(root, "skills", "references");
+			const outside = path.join(root, "outside.md");
+			await fs.mkdir(references, { recursive: true });
+			await fs.writeFile(outside, "outside", "utf8");
+			await fs.symlink(outside, path.join(references, "escape.md"));
+			const shared = await loadPortableSharedSkill(root);
+
+			await expect(
+				new SkillProtocolHandler().resolve(parseInternalUrl("skill://portable-shared/references/escape.md"), {
+					skills: [shared!],
+				}),
+			).rejects.toThrow("Path traversal is not allowed");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("replaces managed collisions but preserves authored portable-shared skills", () => {
+		const shared: Skill = {
+			name: "portable-shared",
+			description: "shared",
+			filePath: "/agent/skills",
+			baseDir: "/agent/skills",
+			source: "native:user",
+			hide: true,
+		};
+		const managed: Skill = {
+			...shared,
+			filePath: "/agent/managed-skills/portable-shared/SKILL.md",
+			baseDir: "/agent/managed-skills/portable-shared",
+			source: "omp-managed:user",
+			_source: {
+				provider: "omp-managed",
+				providerName: "Managed",
+				level: "user",
+				path: "/agent/managed-skills",
+			},
+		};
+		const authored: Skill = {
+			...shared,
+			filePath: "/project/skills/portable-shared/SKILL.md",
+			baseDir: "/project/skills/portable-shared",
+			source: "custom:project",
+			_source: {
+				provider: "custom",
+				providerName: "Custom",
+				level: "project",
+				path: "/project/skills",
+			},
+		};
+
+		const managedMap = new Map([[managed.name, managed]]);
+		registerPortableSharedSkill(managedMap, shared);
+		expect(managedMap.get("portable-shared")?.filePath).toBe(shared.filePath);
+
+		const authoredMap = new Map([[authored.name, authored]]);
+		registerPortableSharedSkill(authoredMap, shared);
+		expect(authoredMap.get("portable-shared")?.filePath).toBe(authored.filePath);
+	});
+
+	it("rejects unresolved mandatory skill references with source evidence", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mandatory-skill-ref-"));
+		try {
+			const filePath = path.join(root, "SKILL.md");
+			await fs.writeFile(filePath, "Required: skill://missing/reference.md\n", "utf8");
+			const skill: Skill = {
+				name: "source-skill",
+				description: "source",
+				filePath,
+				baseDir: root,
+				source: "test:user",
+			};
+			await expect(validateSkillReferences([skill])).rejects.toThrow(
+				`${filePath}: skill://missing/reference.md: Unknown skill: missing`,
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("warns for OPTIONAL unresolved references and ignores fenced examples", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-optional-skill-ref-"));
+		try {
+			const filePath = path.join(root, "SKILL.md");
+			await fs.writeFile(
+				filePath,
+				"OPTIONAL: skill://missing/optional.md\n````text\nskill://missing/four-backtick-example.md\n````not-a-close\nskill://missing/still-fenced.md\n````\n~~~text\nskill://missing/unclosed-example.md\n",
+				"utf8",
+			);
+			const skill: Skill = {
+				name: "source-skill",
+				description: "source",
+				filePath,
+				baseDir: root,
+				source: "test:user",
+			};
+			const warnings = await validateSkillReferences([skill]);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0].skillPath).toBe(filePath);
+			expect(warnings[0].message).toContain("skill://missing/optional.md");
+			expect(warnings[0].message).not.toContain("example.md");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not treat four-space-indented pseudo-fences as Markdown fences", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-indented-skill-ref-"));
+		try {
+			const filePath = path.join(root, "SKILL.md");
+			await fs.writeFile(filePath, "    ```text\nskill://missing/not-fenced.md\n    ```\n", "utf8");
+			const skill: Skill = {
+				name: "source-skill",
+				description: "source",
+				filePath,
+				baseDir: root,
+				source: "test:user",
+			};
+			await expect(validateSkillReferences([skill])).rejects.toThrow(
+				`${filePath}: skill://missing/not-fenced.md: Unknown skill: missing`,
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("closes valid CRLF Markdown fences before validating following references", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-crlf-skill-ref-"));
+		try {
+			const filePath = path.join(root, "SKILL.md");
+			await fs.writeFile(
+				filePath,
+				"```text\r\nskill://missing/fenced.md\r\n```\r\nskill://missing/after-fence.md\r\n",
+				"utf8",
+			);
+			const skill: Skill = {
+				name: "source-skill",
+				description: "source",
+				filePath,
+				baseDir: root,
+				source: "test:user",
+			};
+			await expect(validateSkillReferences([skill])).rejects.toThrow(
+				`${filePath}: skill://missing/after-fence.md: Unknown skill: missing`,
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not hide references behind malformed backtick fence candidates", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-malformed-fence-ref-"));
+		try {
+			const filePath = path.join(root, "SKILL.md");
+			const skill: Skill = {
+				name: "source-skill",
+				description: "source",
+				filePath,
+				baseDir: root,
+				source: "test:user",
+			};
+			for (const content of [
+				"```lang`invalid\nskill://missing/unclosed-malformed.md\n",
+				"```lang`invalid\nskill://missing/closed-malformed.md\n```\n",
+			]) {
+				await fs.writeFile(filePath, content, "utf8");
+				await expect(validateSkillReferences([skill])).rejects.toThrow("Unknown skill: missing");
+			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });

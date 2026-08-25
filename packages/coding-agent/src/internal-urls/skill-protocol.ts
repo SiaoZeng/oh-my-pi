@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { getActiveSkills } from "../extensibility/skills";
 import { buildDirectoryResource } from "./filesystem-resource";
+import { resolveSkillRealPath, resolveSkillTargetPath } from "./skill-target";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 function getContentType(filePath: string): InternalResource["contentType"] {
@@ -21,19 +22,8 @@ function getContentType(filePath: string): InternalResource["contentType"] {
 	return "text/plain";
 }
 
-/**
- * Validate that a path is safe (no traversal, no absolute paths).
- */
-export function validateRelativePath(relativePath: string): void {
-	if (path.isAbsolute(relativePath)) {
-		throw new Error("Absolute paths are not allowed in skill:// URLs");
-	}
-
-	const normalized = path.normalize(relativePath);
-	if (normalized.startsWith("..") || normalized.includes("/../") || normalized.includes("/..")) {
-		throw new Error("Path traversal (..) is not allowed in skill:// URLs");
-	}
-}
+export { validateSkillReferences } from "./skill-reference-validation";
+export { validateRelativePath } from "./skill-target";
 
 /**
  * Handler for skill:// URLs.
@@ -44,36 +34,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		const skills = context?.skills ?? getActiveSkills();
-
-		const skillName = url.rawHost || url.hostname;
-		if (!skillName) {
-			throw new Error("skill:// URL requires a skill name: skill://<name>");
-		}
-
-		const skill = skills.find(s => s.name === skillName);
-		if (!skill) {
-			const available = skills.map(s => s.name);
-			const availableStr = available.length > 0 ? available.join(", ") : "none";
-			throw new Error(`Unknown skill: ${skillName}\nAvailable: ${availableStr}`);
-		}
-
-		let targetPath: string;
-		const urlPath = url.pathname;
-		const hasRelativePath = urlPath && urlPath !== "/" && urlPath !== "";
-
-		if (hasRelativePath) {
-			const relativePath = decodeURIComponent(urlPath.slice(1));
-			validateRelativePath(relativePath);
-			targetPath = path.join(skill.baseDir, relativePath);
-
-			const resolvedPath = path.resolve(targetPath);
-			const resolvedBaseDir = path.resolve(skill.baseDir);
-			if (!resolvedPath.startsWith(resolvedBaseDir + path.sep) && resolvedPath !== resolvedBaseDir) {
-				throw new Error("Path traversal is not allowed");
-			}
-		} else {
-			targetPath = skill.filePath;
-		}
+		const { targetPath, baseDir } = resolveSkillTargetPath(url, skills);
 
 		let stats: fsTypes.Stats;
 		try {
@@ -84,21 +45,22 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			}
 			throw error;
 		}
+		const realTargetPath = await resolveSkillRealPath(targetPath, baseDir);
 
 		if (stats.isDirectory()) {
-			return buildDirectoryResource(url.href, targetPath);
+			return buildDirectoryResource(url.href, realTargetPath);
 		}
 		if (!stats.isFile()) {
 			throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
 		}
 
-		const content = await Bun.file(targetPath).text();
+		const content = await Bun.file(realTargetPath).text();
 		return {
 			url: url.href,
 			content,
-			contentType: getContentType(targetPath),
+			contentType: getContentType(realTargetPath),
 			size: Buffer.byteLength(content, "utf-8"),
-			sourcePath: targetPath,
+			sourcePath: realTargetPath,
 			notes: [],
 		};
 	}
